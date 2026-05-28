@@ -1,3 +1,7 @@
+### bootstrap-README is automated setup.
+
+
+## old manual setup /use at own risk..
 ### 1. prereqs
 sudo apt install -y ansible vim unzip
 ### 2. download the 10.2.1 deb 
