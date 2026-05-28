@@ -1,6 +1,8 @@
-### bootstrap-README is automated setup.
+### bootstrap-README is the main setup script
 
 
+---
+---
 ## old manual setup /use at own risk..
 ### 1. prereqs
 sudo apt install -y ansible vim unzip
