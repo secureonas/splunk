@@ -23,6 +23,7 @@ set -euo pipefail
 # ---- Curated Splunk version table -------------------------------------------
 # Add new patches here when validated. Keys = version, values = build hash.
 declare -A SPLUNK_VERSIONS=(
+    [10.4.0]="f798d4d49089"
     [10.2.3]="4d61cf8a5c0c"
     [10.0.6]="098ea5cc39ba"
     [9.4.11]="bbcbf19b5450"
@@ -171,13 +172,19 @@ if [ -z "$SPLUNK_VERSION" ]; then
         echo "Available Splunk versions:"
         i=1
         opts=()
+        default_choice=1
         for v in $(printf '%s\n' "${!SPLUNK_VERSIONS[@]}" | sort -V -r); do
-            echo "  $i) $v"
+            if [ "$v" = "$DEFAULT_VERSION" ]; then
+                echo "  $i) $v   <-- default"
+                default_choice=$i
+            else
+                echo "  $i) $v"
+            fi
             opts+=("$v")
             i=$((i+1))
         done
         echo "  c) custom (specify version + build manually)"
-        choice=$(prompt "Choose version" "1")
+        choice=$(prompt "Choose version" "$default_choice")
         if [ "$choice" = "c" ] || [ "$choice" = "C" ]; then
             SPLUNK_VERSION=$(prompt "Splunk version (e.g. 10.2.3)")
             SPLUNK_BUILD=$(prompt "Build hash (e.g. 4d61cf8a5c0c)")
@@ -351,9 +358,20 @@ if [ "$PLAYBOOK_OK" = "1" ]; then
     log " Log file: $LOG_FILE"
     log " Playbook: $PLAYBOOK_DIR"
 else
-    log " INSTALL FAILED — see $LOG_FILE for details"
+    log " INSTALL FINISHED WITH ERRORS — see $LOG_FILE for details"
     log "==================================================="
     log " The playbook is idempotent. Fix the issue and re-run:"
     log "   cd $PLAYBOOK_DIR && ansible-playbook site.yml"
+    log ""
+    log " NOTE: Splunk itself is likely installed and running even if a late"
+    log " step failed. The admin password is below and is also recoverable via:"
+    log "   grep splunk_admin_password $PLAYBOOK_DIR/group_vars/splunk_standalone.yml"
+    log ""
+    log "==================================================="
+    log "  ADMIN PASSWORD — SAVE THIS NOW"
+    log "==================================================="
+    log "  Username: admin"
+    log "  Password: ${ADMIN_PASSWORD}"
+    log "==================================================="
     exit 1
 fi
