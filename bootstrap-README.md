@@ -47,6 +47,7 @@ sudo bash bootstrap.sh -y \
 ## Curated Splunk versions
 
 Update the `SPLUNK_VERSIONS` array at the top of `bootstrap.sh` when validating a new patch. Current entries:
+- `10.4.0` (build `f798d4d49089`)
 - `10.2.3` (build `4d61cf8a5c0c`) — default
 - `10.0.6` (build `098ea5cc39ba`)
 - `9.4.11` (build `bbcbf19b5450`)
