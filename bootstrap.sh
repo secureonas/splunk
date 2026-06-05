@@ -1,7 +1,11 @@
 #!/bin/bash
 # =============================================================================
-# Splunk Enterprise Standalone — Bootstrap installer (Ubuntu 24.04)
+# Splunk Enterprise Standalone — Bootstrap installer
 # Secureon d.o.o.
+#
+# Supported OSes:
+#   - Ubuntu 24.04 LTS (and likely 22.04)
+#   - RHEL 9/10, Rocky 9/10, AlmaLinux 9/10, Oracle Linux 9/10
 #
 # Usage (interactive, lab / connected client):
 #   curl -sL https://raw.githubusercontent.com/secureonas/splunk/main/bootstrap.sh | sudo bash
@@ -125,11 +129,28 @@ log "==================================================="
 
 [ "$(id -u)" -eq 0 ] || err "Must run as root (use sudo)."
 
-if [ ! -f /etc/os-release ] || ! grep -q "Ubuntu" /etc/os-release; then
-    err "This bootstrap supports Ubuntu only. Detected: $(. /etc/os-release; echo "$PRETTY_NAME")"
+# Detect OS family: Debian (Ubuntu) or RedHat (RHEL/Rocky/Alma/Oracle Linux)
+OS_FAMILY=""
+PKG_EXT=""
+PKG_INSTALL_CMD=""
+if [ ! -f /etc/os-release ]; then
+    err "Cannot detect OS — /etc/os-release missing."
 fi
-UBUNTU_VER=$(. /etc/os-release; echo "$VERSION_ID")
-log "OS: Ubuntu $UBUNTU_VER"
+. /etc/os-release
+case "${ID_LIKE:-$ID}" in
+    *debian*|*ubuntu*|ubuntu|debian)
+        OS_FAMILY="Debian"
+        PKG_EXT="deb"
+        ;;
+    *rhel*|*fedora*|rhel|centos|rocky|almalinux|ol|oraclelinux)
+        OS_FAMILY="RedHat"
+        PKG_EXT="rpm"
+        ;;
+    *)
+        err "Unsupported OS: $PRETTY_NAME (need Ubuntu or RHEL family)"
+        ;;
+esac
+log "OS: $PRETTY_NAME (family: $OS_FAMILY, package: $PKG_EXT)"
 
 # Existing install detection
 if [ -d /opt/splunk/bin ]; then
@@ -233,9 +254,13 @@ fi
 # =============================================================================
 log ""
 log "--- Installing prerequisites ---"
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq | tee -a "$LOG_FILE"
-apt-get install -y -qq ansible vim unzip wget curl tar | tee -a "$LOG_FILE"
+if [ "$OS_FAMILY" = "Debian" ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq 2>&1 | tee -a "$LOG_FILE"
+    apt-get install -y -qq ansible vim unzip wget curl tar 2>&1 | tee -a "$LOG_FILE"
+else
+    dnf install -y ansible-core vim unzip wget curl tar 2>&1 | tee -a "$LOG_FILE"
+fi
 log "Installed: ansible vim unzip wget curl tar"
 
 # =============================================================================
@@ -271,22 +296,26 @@ log "Playbook ready at $PLAYBOOK_DIR"
 # =============================================================================
 # Fetch the Splunk .deb directly from download.splunk.com
 # =============================================================================
-SPLUNK_DEB="splunk-${SPLUNK_VERSION}-${SPLUNK_BUILD}-linux-amd64.deb"
-SPLUNK_URL="https://download.splunk.com/products/splunk/releases/${SPLUNK_VERSION}/linux/${SPLUNK_DEB}"
-DEB_DEST="${PLAYBOOK_DIR}/roles/splunk_standalone/files/${SPLUNK_DEB}"
+if [ "$OS_FAMILY" = "Debian" ]; then
+    SPLUNK_PKG="splunk-${SPLUNK_VERSION}-${SPLUNK_BUILD}-linux-amd64.deb"
+else
+    SPLUNK_PKG="splunk-${SPLUNK_VERSION}-${SPLUNK_BUILD}.x86_64.rpm"
+fi
+SPLUNK_URL="https://download.splunk.com/products/splunk/releases/${SPLUNK_VERSION}/linux/${SPLUNK_PKG}"
+PKG_DEST="${PLAYBOOK_DIR}/roles/splunk_standalone/files/${SPLUNK_PKG}"
 
 log ""
-log "--- Downloading Splunk .deb ---"
+log "--- Downloading Splunk package ---"
 log "URL: $SPLUNK_URL"
 
-if [ -f "$DEB_DEST" ]; then
-    log "Already present at $DEB_DEST — skipping download."
+if [ -f "$PKG_DEST" ]; then
+    log "Already present at $PKG_DEST — skipping download."
 else
-    mkdir -p "$(dirname "$DEB_DEST")"
-    wget --progress=dot:giga -O "$DEB_DEST" "$SPLUNK_URL" 2>&1 | tee -a "$LOG_FILE"
-    [ -s "$DEB_DEST" ] || err "Download failed or empty. Check version/build hash."
+    mkdir -p "$(dirname "$PKG_DEST")"
+    wget --progress=dot:giga -O "$PKG_DEST" "$SPLUNK_URL" 2>&1 | tee -a "$LOG_FILE"
+    [ -s "$PKG_DEST" ] || err "Download failed or empty. Check version/build hash."
 fi
-log "Splunk .deb: $(ls -lh "$DEB_DEST" | awk '{print $5}')"
+log "Splunk package: $(ls -lh "$PKG_DEST" | awk '{print $5}')"
 
 # =============================================================================
 # Configure group_vars from inputs
@@ -297,14 +326,21 @@ log "--- Configuring group_vars ---"
 GV="${PLAYBOOK_DIR}/group_vars/splunk_standalone.yml"
 [ -f "$GV" ] || err "group_vars file missing at $GV"
 
-# Use sed to substitute the three key vars (filename, indexer IP, admin password)
+# Use sed to substitute the key vars (filename, indexer IP, admin password, role).
 # These keys must exist in the shipped group_vars — the role expects them.
-sed -i "s|^splunk_pkg_deb:.*|splunk_pkg_deb: \"${SPLUNK_DEB}\"|" "$GV"
+# Patch the OS-specific package key based on what we downloaded.
+if [ "$OS_FAMILY" = "Debian" ]; then
+    sed -i "s|^splunk_pkg_deb:.*|splunk_pkg_deb: \"${SPLUNK_PKG}\"|" "$GV"
+    PATCHED_PKG_KEY="splunk_pkg_deb"
+else
+    sed -i "s|^splunk_pkg_rpm:.*|splunk_pkg_rpm: \"${SPLUNK_PKG}\"|" "$GV"
+    PATCHED_PKG_KEY="splunk_pkg_rpm"
+fi
 sed -i "s|^splunk_indexer_ip:.*|splunk_indexer_ip: \"${INDEXER_IP}\"|" "$GV"
 sed -i "s|^splunk_admin_password:.*|splunk_admin_password: \"${ADMIN_PASSWORD}\"|" "$GV"
 sed -i "s|^splunk_role:.*|splunk_role: \"${ROLE}\"|" "$GV"
 
-log "Updated: splunk_pkg_deb, splunk_indexer_ip, splunk_admin_password, splunk_role"
+log "Updated: ${PATCHED_PKG_KEY}, splunk_indexer_ip, splunk_admin_password, splunk_role"
 
 # =============================================================================
 # Install Ansible collection
