@@ -129,6 +129,59 @@ cat /sys/kernel/mm/transparent_hugepage/enabled
 sudo usermod -aG adm splunk
 ```
 
+
+
+
+## 6. Syslog: priprava /syslog direktorija
+
+### A) Nova namestitev — /syslog se ustvari
+
+```bash
+# Direktorij kamor rsyslog pise prejete syslog podatke
+sudo mkdir -p /syslog
+sudo chown syslog:adm /syslog
+sudo chmod 755 /syslog
+```
+
+### B) Migracija obstojecega /syslog
+
+Ce /syslog ze obstaja in vsebuje podatke (rsyslog je ze pisal vanj — npr. ko
+je splunk tekel kot root), je treba popraviti samo lastnistvo in pravice.
+**NE brisi vsebine** — obstojeci podatki ostanejo nedotaknjeni.
+
+```bash
+# 1. Najprej preveri trenutno stanje
+sudo ls -la /syslog/
+sudo ls -la /syslog/*/ 2>/dev/null | head
+
+# Pricakovano (pravilno):
+#   /syslog        -> syslog:adm  drwxr-xr-x  (0755)
+#   /syslog/<ip>/  -> syslog:adm  drwxr-xr-x  (0755)
+#   *.log datoteke -> syslog:adm  -rw-r--r--  (0644)
+#
+# Ce je tako, NIC ne spreminjaj.
+```
+
+Ce so lastnistvo ali pravice napacne (npr. datoteke owned root:root, mode 0600):
+
+```bash
+# 2. Popravi lastnistvo rekurzivno
+sudo chown -R syslog:adm /syslog
+
+# 3. Popravi pravice — VELIKI X = execute samo na direktorijih, ne na datotekah
+#    Rezultat: dir 0755, file 0644
+sudo chmod -R u=rwX,g=rX,o=rX /syslog
+
+# 4. Preveri rezultat
+sudo ls -la /syslog/
+sudo ls -la /syslog/*/ | head
+```
+
+**Opozorilo:** NE uporabljaj `chmod -R 0644 /syslog` — to bi odstranilo
+execute bit z direktorijev in jih naredilo nedostopne (cd, ls bi vrgla
+"Permission denied"). Veliki X v chmod simbolnem zapisu pravilno locuje
+med datotekami in direktoriji.
+
 ---
 
 ## 6. Syslog: priprava /syslog direktorija
