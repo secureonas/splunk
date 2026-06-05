@@ -184,16 +184,7 @@ med datotekami in direktoriji.
 
 ---
 
-## 6. Syslog: priprava /syslog direktorija
 
-```bash
-# Direktorij kamor rsyslog pise prejete syslog podatke
-sudo mkdir -p /syslog
-sudo chown syslog:adm /syslog
-sudo chmod 755 /syslog
-```
-
----
 
 ## 7. Syslog: rsyslog konfiguracija (UDP + TCP 514)
 
