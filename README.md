@@ -93,7 +93,8 @@ The script ships with a curated table of validated versions:
 | Version | Build hash | Notes |
 |---|---|---|
 | 10.4.0 | f798d4d49089 | latest |
-| **10.2.3** | **4d61cf8a5c0c** | **default — current 10.2 patch** |
+| **10.2.4** | **1526e5e5df42** | **default — current 10.2 patch** |
+| 10.2.3 | 4d61cf8a5c0c | previous 10.2 patch |
 | 10.0.6 | 098ea5cc39ba | 10.0 maintenance line |
 | 9.4.11 | bbcbf19b5450 | older clients still on 9.x |
 
