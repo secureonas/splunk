@@ -28,11 +28,12 @@ set -euo pipefail
 # Add new patches here when validated. Keys = version, values = build hash.
 declare -A SPLUNK_VERSIONS=(
     [10.4.0]="f798d4d49089"
+    [10.2.4]="1526e5e5df42"
     [10.2.3]="4d61cf8a5c0c"
     [10.0.6]="098ea5cc39ba"
     [9.4.11]="bbcbf19b5450"
 )
-DEFAULT_VERSION="10.2.3"
+DEFAULT_VERSION="10.2.4"
 
 # ---- Repo & artifact locations ----------------------------------------------
 REPO_RAW="https://raw.githubusercontent.com/secureonas/splunk/main"
