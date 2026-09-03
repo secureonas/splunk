@@ -1,99 +1,103 @@
-# Splunk Enterprise — Migrating from root to the `splunk` user
+# Splunk Enterprise — migracija iz root v `splunk` uporabnika
 
-Converting a standalone Splunk Enterprise instance that runs as **root** into
-one that runs as a dedicated **`splunk`** user under **systemd**, on Ubuntu.
+Pretvorba obstoječe Splunk Enterprise namestitve, ki teče kot **root**, v
+namestitev, ki teče kot namenski **`splunk`** uporabnik pod **systemd**.
 
-Covers `$SPLUNK_HOME`, external index volumes (`coldPath`, `coldToFrozenDir`),
-rsyslog ingestion directories, privileged ports, systemd unit and polkit rules.
+Pokriva `$SPLUNK_HOME`, zunanje index volumne (`coldPath`, `coldToFrozenDir`),
+rsyslog ingestion, privilegirana vrata, systemd unit, polkit, AppArmor/SELinux,
+logrotate in THP.
 
-> **Do this on a clone first.** The migration is reversible in principle but
-> the failure modes are quiet — data that stops arriving rather than a service
-> that fails to start. Take a VM snapshot before you begin.
+Primarna platforma: **Ubuntu 22.04 / 24.04**. Razlike za **Rocky Linux / RHEL**
+so v sekciji 14.
 
-> **Version note.** From Splunk 10.2, the CLI defaults to the `splunk` user
-> unless `SPLUNK_OS_USER` says otherwise, and running as root is deprecated
-> and slated for removal. This migration is where you want to end up anyway.
+> **Najprej naredi na klonu.** Migracija je načeloma povratna, ampak načini
+> odpovedi so tihi — podatki nehajo prihajati, servis pa se normalno zažene.
+> Pred začetkom naredi VM snapshot.
 
----
-
-## 0. What actually blocks this
-
-Work these out before the window. Each one turns a 30-minute job into a
-rollback.
-
-| Blocker | Why | Section |
-|---|---|---|
-| Splunk Web on 443 | non-root cannot bind < 1024 | 6 |
-| Syslog input on 514 / 6514 | same | 6, 7 |
-| External cold/frozen volumes | root-owned, splunkd can't write | 5 |
-| Syslog files root-owned | splunk can't read, ingestion stops silently | 7 |
-| `splunk` is a login account | migration gains you little if it has `sudo` | 3 |
-| Cron jobs running `splunk` as root | recreate root-owned files after migration | 11 |
+> **Opomba o verziji.** Od Splunk 10.2 naprej CLI privzeto teče kot `splunk`
+> uporabnik, razen če `SPLUNK_OS_USER` pove drugače. Tek kot root je
+> deprecated in predviden za odstranitev.
 
 ---
 
-## 1. Pre-migration inventory
+## 0. Kaj dejansko blokira migracijo
 
-Capture everything first — you compare against this afterwards.
+Te stvari razčisti pred vzdrževalnim oknom. Vsaka od njih spremeni 30-minutno
+opravilo v rollback.
+
+| Blokada | Zakaj | Sekcija |
+| --- | --- | --- |
+| Splunk Web na 443 | non-root ne sme bind-at < 1024 | 6 |
+| Syslog na 514 / 6514 | isto | 7, 8 |
+| Zunanji cold/frozen volumni | root-owned, splunkd ne more pisati | 5 |
+| Syslog datoteke root-owned | splunk ne more brati, ingestion tiho stoji | 7 |
+| AppArmor profil (Ubuntu) | rsyslog ne sme pisati v `/syslog` | 7 |
+| `splunk` je login račun s `sudo` | migracija ti prinese malo | 3 |
+| Cron opravila, ki poganjajo splunk kot root | po migraciji spet ustvarijo root-owned datoteke | 13 |
+
+---
+
+## 1. Inventar pred migracijo
+
+Vse zajemi najprej — kasneje primerjaš proti temu.
 
 ```bash
-# Current state
+# Trenutno stanje
 /opt/splunk/bin/splunk version
 /opt/splunk/bin/splunk status
 ps -ef | grep [s]plunkd | head -3
 
-# Boot-start method
+# Nacin boot-start
 systemctl list-unit-files | grep -i splunk
 ls -l /etc/init.d/splunk* 2>/dev/null
 grep -vE '^\s*(#|$)' /opt/splunk/etc/splunk-launch.conf
 
-# Where the data actually lives — do NOT assume it is all under /opt/splunk
+# Kje podatki dejansko lezijo — NE predpostavljaj, da je vse pod /opt/splunk
 /opt/splunk/bin/splunk btool indexes list --debug \
   | grep -E 'homePath|coldPath|thawedPath|coldToFrozenDir|coldToFrozenScript' \
   | sort -u > /root/index-paths-pre.txt
 
-# Ports in use, including privileged ones
+# Vrata v uporabi, vkljucno s privilegiranimi
 ss -tlnp | grep -E '443|8000|8089|8191|9997|514|6514|8443' > /root/ports-pre.txt
 
-# Baselines for later comparison
+# Baseline za kasnejso primerjavo
 /opt/splunk/bin/splunk btool check 2>&1 > /root/btool-pre.txt
 /opt/splunk/bin/splunk list index      > /root/indexes-pre.txt
 ls /opt/splunk/etc/apps/               > /root/apps-pre.txt
 
-# Config backup
+# Backup konfiguracije
 tar czf /root/splunk-etc-premigration-$(date +%F).tgz -C /opt/splunk etc
 ```
 
-Read `/root/index-paths-pre.txt` carefully. Every distinct path outside
-`/opt/splunk` needs the treatment in section 5.
+Preberi `/root/index-paths-pre.txt` pozorno. Vsaka pot izven `/opt/splunk`
+potrebuje obravnavo iz sekcije 5.
 
 ---
 
-## 2. Stop Splunk
+## 2. Ustavi Splunk
 
 ```bash
 /opt/splunk/bin/splunk stop
 /opt/splunk/bin/splunk status
-ps -ef | grep -E '[s]plunkd|[m]ongod'      # nothing should remain
+ps -ef | grep -E '[s]plunkd|[m]ongod'      # nic ne sme ostati
 
-# Remove the old boot-start (init.d script or systemd unit) — it points at root
+# Odstrani stari boot-start (init.d skripta ali systemd unit) — kaze na root
 /opt/splunk/bin/splunk disable boot-start
 ```
 
 ---
 
-## 3. The `splunk` user
+## 3. `splunk` uporabnik
 
-If the account already exists, check what it actually is:
+Če račun že obstaja, preveri, kaj dejansko je:
 
 ```bash
 id splunk
 ```
 
-**A UID in the 1000+ range with `sudo`, `plugdev`, `lpadmin` etc. is an
-interactive login account, not a service account.** Running splunkd as an
-account that can `sudo` to root defeats most of the point of this migration.
-Either strip the privileged groups:
+**UID v obsegu 1000+ s `sudo`, `plugdev`, `lpadmin` itd. je interaktivni login
+račun, ne servisni račun.** Če lahko `splunk` naredi `sudo` do root-a, si z
+migracijo pridobil malo. Odstrani privilegirane skupine:
 
 ```bash
 gpasswd -d splunk sudo
@@ -101,18 +105,17 @@ gpasswd -d splunk plugdev
 gpasswd -d splunk lpadmin
 gpasswd -d splunk cdrom
 gpasswd -d splunk dip
-usermod -s /usr/sbin/nologin splunk       # only if nothing needs to log in as splunk
+usermod -s /usr/sbin/nologin splunk    # samo ce se nihce ne prijavlja kot splunk
 ```
 
-or create a proper service account and reassign ownership to it.
-
-If it does not exist:
+Če računa ni:
 
 ```bash
 useradd -r -m -d /opt/splunk -s /bin/bash splunk
 ```
 
-Either way, `splunk` needs to be in `adm` to read syslog files (section 7):
+V vsakem primeru mora biti `splunk` v skupini `adm`, da bere syslog datoteke
+(sekcija 7) in standardne loge v `/var/log`:
 
 ```bash
 usermod -aG adm splunk
@@ -121,198 +124,395 @@ id splunk
 
 ---
 
-## 4. `$SPLUNK_HOME` ownership
+## 4. Lastništvo `$SPLUNK_HOME`
 
 ```bash
 chown -R splunk:splunk /opt/splunk
-find /opt/splunk ! -user splunk | head          # expect empty
+find /opt/splunk ! -user splunk | head          # pricakovano prazno
 ```
 
-This is also what the 10.x package preinstall requires — it drops privileges
-to `splunk` and aborts its prechecks if it cannot read the tree.
+Na velikih namestitvah traja dolgo (indexi, kvstore, podatki).
+
+To zahteva tudi preinstall 10.x paketa — ta spusti privilegije na `splunk` in
+prekine prechecke, če ne more brati drevesa. Če `dpkg -i` javi napako na
+root-owned datotekah, je to razlog.
 
 ---
 
-## 5. External index volumes
+## 5. Zunanji index volumni
 
-For every path from `/root/index-paths-pre.txt` that sits outside
-`/opt/splunk` — typically `/colddb`, `/frozenpath`, `/thaweddb`, or a mounted
-archive volume:
+Za vsako pot iz `/root/index-paths-pre.txt`, ki je izven `/opt/splunk` —
+običajno `/colddb`, `/frozenpath`, `/thaweddb` ali priklopljen arhivni volumen:
 
 ```bash
 chown -R splunk:splunk /colddb /frozenpath
-chmod 750 /colddb /frozenpath        # top level ONLY
+chmod 750 /colddb /frozenpath        # SAMO vrhnji nivo
 ```
 
-**Do not `chmod -R`.** Splunk creates bucket directories `700` and files `600`
-itself. Recursive mode changes either loosen every bucket for no benefit or
-churn tens of thousands of inodes to no effect. Fix ownership recursively; set
-the mode on the top-level directory only.
+**Ne uporabljaj `chmod -R`.** Splunk sam ustvarja bucket direktorije `700` in
+datoteke `600`. Rekurzivna sprememba pravic ali po nepotrebnem odpre vsak
+bucket ali pa premelje deset tisoče inode-ov brez učinka. Lastništvo popravi
+rekurzivno, pravice samo na vrhnjem direktoriju.
 
-What splunkd needs:
+Kaj splunkd potrebuje:
 
-- **coldPath** — read, write and traverse. It moves warm buckets in and deletes
-  them at retention, so it needs write on the *directory*, not just the buckets.
-- **coldToFrozenDir** — write and traverse.
-- **coldToFrozenScript** — the script runs *as the splunk user*. It needs `+x`
-  for splunk, and anything it writes to must be splunk-writable.
+- **coldPath** — branje, pisanje, traverse. Warm buckete premika noter in jih
+  ob retention briše, torej rabi write na *direktoriju*, ne samo na bucketih.
+- **coldToFrozenDir** — pisanje in traverse.
+- **coldToFrozenScript** — skripta teče *kot splunk uporabnik*. Rabi `+x` za
+  splunk, in karkoli piše, mora biti splunk-writable.
 
-Traverse permission is needed on every parent component, not just the leaf:
+Traverse pravica je potrebna na vsaki nadrejeni komponenti, ne samo na listu:
 
 ```bash
 namei -l /colddb /frozenpath
 ```
 
-Verify rather than assume:
+Preveri, ne predpostavljaj:
 
 ```bash
 sudo -u splunk touch /colddb/.wtest && sudo -u splunk rm /colddb/.wtest && echo cold-ok
 sudo -u splunk touch /frozenpath/.wtest && sudo -u splunk rm /frozenpath/.wtest && echo frozen-ok
 ```
 
-### Separate filesystems and network storage
+### Ločeni filesystemi in mrežna hramba
 
-- **Mount points:** `chown` on a mount point affects the mounted filesystem. If
-  it ever fails to mount, splunkd writes to the underlying directory and
-  silently fills `/`. Confirm the mount is present before starting Splunk.
-- **NFS/CIFS:** ownership comes from mount options (`uid=`/`gid=`), not
-  `chown`, and root-squash will bite. Frozen on NFS is workable; cold on NFS is
-  asking for trouble.
+- **Mount pointi:** `chown` na mount pointu spremeni priklopljen filesystem. Če
+  se kdaj ne priklopi, splunkd piše v spodaj ležeči direktorij in tiho napolni
+  `/`. Pred zagonom Splunka potrdi, da je mount prisoten.
+- **NFS/CIFS:** lastništvo določajo mount opcije (`uid=`/`gid=`), ne `chown`, in
+  root-squash te bo ugriznil. Frozen na NFS je izvedljiv, cold na NFS je
+  iskanje težav.
 
 ---
 
-## 6. `splunk-launch.conf` and privileged ports
+## 6. `splunk-launch.conf` in privilegirana vrata
 
 ```bash
-# CHANGE the existing line — do not append a second one
+# SPREMENI obstojeco vrstico — ne dodajaj druge
 sed -i 's/^SPLUNK_OS_USER=.*/SPLUNK_OS_USER=splunk/' /opt/splunk/etc/splunk-launch.conf
+
+# Ce vrstice sploh ni:
+grep -q '^SPLUNK_OS_USER' /opt/splunk/etc/splunk-launch.conf \
+  || echo "SPLUNK_OS_USER=splunk" >> /opt/splunk/etc/splunk-launch.conf
+
 grep -vE '^\s*(#|$)' /opt/splunk/etc/splunk-launch.conf
 ```
 
-### Splunk Web on 443
+### Splunk Web na 443
 
-A non-root process cannot bind ports below 1024. Pick one:
+Non-root proces ne more bind-ati vrat pod 1024. Izberi eno:
 
-**a) Move Web to a high port and redirect (recommended).**
+**a) Web na visoka vrata + redirect (priporočeno).**
 
 ```bash
 # web.conf
+sudo -u splunk tee -a /opt/splunk/etc/system/local/web.conf >/dev/null <<'EOF'
 [settings]
+enableSplunkWebSSL = 1
 httpport = 8443
-enableSplunkWebSSL = true
+EOF
 ```
 
 ```bash
+# iptables-persistent, da pravila prezivijo reboot
+# Pri vprasanju "Save current rules?" odgovori Yes
+apt update
+apt install -y iptables-persistent
+
+# Promet iz omrezja: 443 -> 8443
 iptables -t nat -A PREROUTING -p tcp --dport 443 -j REDIRECT --to-port 8443
+# Lokalni promet (curl localhost): 443 -> 8443
 iptables -t nat -A OUTPUT -o lo -p tcp --dport 443 -j REDIRECT --to-port 8443
-netfilter-persistent save        # WITHOUT this the rule vanishes at reboot
+
+# BREZ tega pravilo ob rebootu izgine
+netfilter-persistent save
+
+iptables -t nat -L -n -v
 ```
 
-**b) Grant the capability instead** — add to the systemd drop-in in section 8:
+**b) Podeli capability namesto redirecta** — dodaj v systemd drop-in iz
+sekcije 10:
 
 ```
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 ```
 
-Simpler, but it applies to the whole process tree, which is a broader grant
-than the redirect.
+Enostavneje, ampak velja za celotno procesno drevo — širša podelitev kot
+redirect.
 
-**c) Reverse proxy** (nginx/haproxy) terminating 443 and forwarding to 8000.
+**c) Reverse proxy** (nginx/haproxy) terminira 443 in posreduje na 8000.
 
-### Syslog on 514 / 6514
+### Syslog na 514 / 6514
 
-Don't try to make splunkd bind these. Let rsyslog own the privileged port and
-have Splunk read files — section 7.
+Ne poskušaj, da bi splunkd bind-al ta vrata. Naj privilegirana vrata drži
+rsyslog, Splunk pa bere datoteke — sekcija 7.
 
 ---
 
-## 7. Syslog ingestion
+## 7. Syslog ingestion (Ubuntu)
 
-rsyslog keeps running as root (or drops to `syslog:adm`), binds 514, and writes
-files that the `splunk` user reads via a monitor input. Nothing about the
-Splunk side needs privilege.
+rsyslog teče naprej, bind-a 514 in spusti privilegije na `syslog:adm`, piše
+datoteke, ki jih `splunk` bere preko monitor inputa. Splunk stran ne rabi
+nobenega privilegija.
 
-### rsyslog config
+### 7.1 Direktorij `/syslog`
 
-`/etc/rsyslog.d/40-splunk.conf` — the `DirCreateMode` / `FileCreateMode`
-settings are what make the output readable by Splunk:
+**Nova namestitev:**
 
-```rsyslog
-## Templates
-template (name="d_catch_all" type="string"
-          string="/syslog/%FROMHOST-IP%/%syslogfacility-text%.log")
-
-## Rulesets
-ruleset(name="f_remote_all" queue.type="LinkedList" queue.size="100000") {
-
-    # per-source filters go here, each ending in `stop`
-
-    # Catch all
-    action(type="omfile" DynaFile="d_catch_all"
-           DirCreateMode="0750" FileCreateMode="0640")
-    stop
-}
+```bash
+mkdir -p /syslog
+chown syslog:adm /syslog
+chmod 750 /syslog
 ```
 
-**On the mode.** `0755`/`0644` works because it makes the files world-readable,
-but then every local account on the collector can read client telemetry —
-firewall sessions, auth events, internal hostnames and subnet labels. Since
-`splunk` is in `adm`, `0750`/`0640` gives Splunk exactly the access it needs
-and nothing to anyone else. Use the tighter modes on new builds.
+**Obstoječ `/syslog`:** popravi samo lastništvo in pravice. **Vsebine ne
+briši** — obstoječi podatki ostanejo nedotaknjeni.
 
-If you tighten an existing deployment, existing files keep their old mode —
-`FileCreateMode` only applies at creation:
+```bash
+# Najprej poglej stanje
+ls -la /syslog/
+ls -la /syslog/*/ 2>/dev/null | head
+
+# Pricakovano:
+#   /syslog        -> syslog:adm  drwxr-x---  (0750)
+#   /syslog/<ip>/  -> syslog:adm  drwxr-x---  (0750)
+#   *.log          -> syslog:adm  -rw-r-----  (0640)
+```
+
+### 7.2 rsyslog konfiguracija (UDP + TCP 514)
+
+`/etc/rsyslog.conf` ne spreminjamo — Ubuntu default ostane nedotaknjen. Vse
+gre v en drop-in.
+
+```bash
+tee /etc/rsyslog.d/40-splunk.conf >/dev/null <<'EOF'
+#### MODULI / LISTENERJI ####
+module(load="imudp")
+input(type="imudp" port="514" ruleset="f_remote_all")
+
+module(load="imtcp")
+input(type="imtcp" port="514" ruleset="f_remote_all")
+
+#### LASTNISTVO IN PRAVICE ####
+# Mora biti PRED ruleset omfile akcijo.
+# $PrivDropToGroup adm je daemon-wide in povozi Ubuntu default 'syslog',
+# tako da so datoteke ustvarjene z grupo adm in jih splunk (v adm) bere.
+$FileOwner syslog
+$FileGroup adm
+$FileCreateMode 0640
+$DirCreateMode 0750
+$Umask 0027
+$PrivDropToUser syslog
+$PrivDropToGroup adm
+
+#### TEMPLATE ####
+# /syslog/<source-ip>/<facility>.log
+template(name="d_catch_all" type="string"
+         string="/syslog/%fromhost-ip%/%syslogfacility-text%.log")
+
+#### RULESET ####
+ruleset(name="f_remote_all" queue.type="LinkedList" queue.size="100000") {
+
+    # per-source filtri gredo sem, vsak konca s `stop`
+
+    action(type="omfile"
+           DynaFile="d_catch_all"
+           DirCreateMode="0750"
+           FileCreateMode="0640")
+    stop
+}
+EOF
+```
+
+**O pravicah.** `0755`/`0644` deluje, ker naredi datoteke world-readable —
+ampak potem vsak lokalni račun na zbiralniku bere telemetrijo strank: firewall
+seje, auth dogodke, interna imena gostiteljev in oznake podomrežij. Ker je
+`splunk` v `adm`, mu `0750`/`0640` da točno toliko dostopa, kot ga rabi, in
+nikomur drugemu nič.
+
+`$PrivDropToGroup adm` in ožje pravice **gresta v paru**. Če postaviš 0640 brez
+te direktive, bodo datoteke `syslog:syslog` in Splunk jih ne bo mogel brati —
+tiho, brez napake.
+
+### 7.3 Zaostritev obstoječe namestitve
+
+`FileCreateMode` velja samo ob nastanku. Obstoječe datoteke obdržijo stare
+pravice:
 
 ```bash
 find /syslog -type d -exec chmod 750 {} +
 find /syslog -type f -exec chmod 640 {} +
 ```
 
-### Ownership sweep
+**Ne uporabljaj `chmod -R 0640 /syslog`** — to bi odvzelo execute bit
+direktorijem in jih naredilo nedostopne (`cd`, `ls` vrneta "Permission
+denied"). Če že rekurzivno, potem s simbolnim zapisom in velikim `X`, ki loči
+med datotekami in direktoriji:
 
-Anything rsyslog wrote while the box was configured differently may still be
-`root:root` and unreadable to Splunk. This fails **silently** — you get a gap
-in older data, not an error:
+```bash
+chmod -R u=rwX,g=rX,o= /syslog
+```
+
+### 7.4 Ownership sweep
+
+Karkoli je rsyslog napisal, ko je bil sistem drugače nastavljen, je lahko še
+vedno `root:root` in za Splunk neberljivo. To odpove **tiho** — dobiš luknjo v
+starejših podatkih, ne napake:
 
 ```bash
 find /syslog \( ! -user syslog -o ! -group adm \) -ls | head -20
 chown -R syslog:adm /syslog
 ```
 
-### Verify as the splunk user
+### 7.5 AppArmor (Ubuntu 22.04 / 24.04)
+
+Ubuntu privzeto prepreči rsyslogu pisanje izven standardnih poti. Lokalni
+override — profil ostane v veljavi, dodamo samo potrebne poti:
 
 ```bash
-sudo -u splunk ls /syslog/*/ | head
-sudo -u splunk head -1 /syslog/<some-ip>/<facility>.log
-ls -la /syslog/*/*.gz | head -3      # rotated files inherit correctly
+tee /etc/apparmor.d/local/usr.sbin.rsyslogd >/dev/null <<'EOF'
+# Dovoli rsyslog pisanje Splunk ingestion datotek pod /syslog
+/syslog/** rw,
+# Dovoli rsyslog branje TLS certifikatov (sekcija 8)
+/etc/rsyslog.d/tls/* r,
+EOF
+
+apparmor_parser -r /etc/apparmor.d/usr.sbin.rsyslogd
 ```
 
-### logrotate
+### 7.6 Restart in preverjanje
 
-If the stanza has no explicit `create` directive, rotated files inherit from
-the original. Confirm after the next rotation rather than assuming.
+```bash
+systemctl restart rsyslog
+systemctl status rsyslog --no-pager
+
+# Mora poslusati na 514 UDP/TCP (in 6514, ce si naredil sekcijo 8)
+ss -tlnp | grep -E '514|6514'
+ss -ulnp | grep 514
+
+# Preveri kot splunk uporabnik — to je edini test, ki steje
+sudo -u splunk ls /syslog/*/ | head
+sudo -u splunk head -1 /syslog/<neki-ip>/<facility>.log
+```
 
 ---
 
-## 8. systemd, polkit and limits
+## 8. Syslog TLS na 6514 (opcijsko)
+
+Potrebno samo, kjer stranka pošilja syslog preko nezaupanega omrežja ali kjer
+to zahteva pogodba. Če ne rabiš, preskoči — imaš en certifikat manj za
+obnavljati.
+
+```bash
+# gnutls driver za rsyslog
+apt update
+apt install -y rsyslog-gnutls
+
+# Self-signed server certifikat (anon mode — sifriranje brez validacije odjemalca)
+mkdir -p /etc/rsyslog.d/tls
+openssl req -x509 -nodes -newkey rsa:2048 \
+  -keyout /etc/rsyslog.d/tls/syslog-server-key.pem \
+  -out /etc/rsyslog.d/tls/syslog-server-cert.pem \
+  -days 3650 -subj "/CN=$(hostname -f)"
+chown syslog:adm /etc/rsyslog.d/tls/*
+chmod 640 /etc/rsyslog.d/tls/syslog-server-key.pem
+chmod 644 /etc/rsyslog.d/tls/syslog-server-cert.pem
+```
+
+```bash
+# TLS listener na 6514 — uporablja isti f_remote_all ruleset
+tee /etc/rsyslog.d/45-splunk-tls.conf >/dev/null <<'EOF'
+global(
+    DefaultNetstreamDriver="gtls"
+    DefaultNetstreamDriverCertFile="/etc/rsyslog.d/tls/syslog-server-cert.pem"
+    DefaultNetstreamDriverKeyFile="/etc/rsyslog.d/tls/syslog-server-key.pem"
+)
+
+module(load="imtcp")
+input(
+    type="imtcp"
+    port="6514"
+    StreamDriver.Name="gtls"
+    StreamDriver.Mode="1"
+    StreamDriver.AuthMode="anon"
+    ruleset="f_remote_all"
+)
+EOF
+
+systemctl restart rsyslog
+ss -tlnp | grep 6514
+```
+
+`anon` pomeni šifriranje brez preverjanja odjemalca. Če rabiš tudi
+avtentikacijo pošiljateljev, je to `StreamDriver.AuthMode="x509/name"` in
+`PermittedPeer` — druga zgodba, ki zahteva CA.
+
+Datum poteka si zapiši. Certifikat velja 10 let in nihče se ga ne bo spomnil.
+
+---
+
+## 9. Logrotate
+
+```bash
+tee /etc/logrotate.d/splunk >/dev/null <<'EOF'
+/syslog/*/*.log
+{
+    daily
+    missingok
+    dateext
+    dateformat -%Y%m%d-%s
+    rotate 7
+    compress
+    notifempty
+    sharedscripts
+    postrotate
+          /usr/bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
+}
+EOF
+```
+
+Ker stanza nima eksplicitne `create` direktive, rotirane datoteke podedujejo
+lastništvo in pravice od originala. To preveri po prvi rotaciji, ne
+predpostavljaj:
+
+```bash
+logrotate -d /etc/logrotate.d/splunk     # dry-run
+ls -la /syslog/*/*.gz | head -3
+```
+
+Če se pokaže, da rotirane datoteke ne podedujejo pravilno, dodaj v stanzo:
+
+```
+create 0640 syslog adm
+```
+
+---
+
+## 10. systemd, polkit, limits, THP
+
+### boot-start
 
 ```bash
 /opt/splunk/bin/splunk enable boot-start -systemd-managed 1 \
   -user splunk -group splunk -create-polkit-rules 1 \
   --accept-license --answer-yes --no-prompt
+
+systemctl daemon-reload
 ```
 
-The unit name follows `SPLUNK_SERVER_NAME` in `splunk-launch.conf` — with
-`SPLUNK_SERVER_NAME=Splunkd` you get `Splunkd.service`.
+Ime unita sledi `SPLUNK_SERVER_NAME` v `splunk-launch.conf` — pri
+`SPLUNK_SERVER_NAME=Splunkd` dobiš `Splunkd.service`.
 
 ### Limits drop-in
 
-Put limits in a drop-in, never in the unit itself — `enable boot-start`
-regenerates the unit and wipes hand-edits.
+Limite daj v drop-in, nikoli v sam unit — `enable boot-start` unit regenerira
+in ročne popravke povozi.
 
 ```bash
 mkdir -p /etc/systemd/system/Splunkd.service.d
-cat > /etc/systemd/system/Splunkd.service.d/limits.conf <<'EOF'
+tee /etc/systemd/system/Splunkd.service.d/limits.conf >/dev/null <<'EOF'
 [Service]
 LimitNOFILE=65536
 LimitNPROC=16384
@@ -320,26 +520,42 @@ LimitFSIZE=infinity
 LimitDATA=infinity
 TasksMax=infinity
 EOF
+
 systemctl daemon-reload
 ```
 
-Running as root masks limit problems; as a normal user they surface
-immediately, usually as search failures under load.
+Dodatno, kot fallback za login shell (systemd za servise ignorira
+`/etc/security/limits.d`, ampak `sudo -u splunk ... splunk` iz shella ga
+upošteva):
+
+```bash
+tee /etc/security/limits.d/99-splunk.conf >/dev/null <<'EOF'
+splunk soft nofile 65536
+splunk hard nofile 65536
+splunk soft nproc 16384
+splunk hard nproc 16384
+splunk soft fsize unlimited
+splunk hard fsize unlimited
+EOF
+```
+
+Tek kot root je maskiral težave z limiti. Kot navaden uporabnik se pokažejo
+takoj, običajno kot padci iskanj pod obremenitvijo.
 
 ### polkit
 
-`-create-polkit-rules 1` writes `/etc/polkit-1/rules.d/10-Splunkd.rules`,
-letting the `splunk` user manage the service without sudo:
+`-create-polkit-rules 1` napiše `/etc/polkit-1/rules.d/10-Splunkd.rules`, kar
+`splunk` uporabniku omogoči upravljanje servisa brez sudo:
 
 ```bash
 cat /etc/polkit-1/rules.d/*Splunkd*
 ```
 
-It must be a `.rules` (JavaScript) file — Ubuntu 24.04 ships polkit 124, which
-dropped `.pkla` support entirely. The generated rule grants `start`, `stop` and
-`restart` only, not `reload`, `enable` or `disable`.
+Mora biti `.rules` (JavaScript) datoteka — Ubuntu 24.04 ima polkit 124, ki je
+podporo za `.pkla` popolnoma opustil. Generirano pravilo podeli samo `start`,
+`stop` in `restart`, ne pa `reload`, `enable` ali `disable`.
 
-If you need to write it by hand:
+Če ga pišeš ročno:
 
 ```javascript
 polkit.addRule(function(action, subject) {
@@ -353,58 +569,71 @@ polkit.addRule(function(action, subject) {
 });
 ```
 
-### Rocky Linux / RHEL
-
-No AppArmor — SELinux instead. A non-standard syslog directory needs a label
-or rsyslog silently cannot write to it:
+### THP (Transparent Huge Pages)
 
 ```bash
-semanage fcontext -a -t var_log_t "/syslog(/.*)?"
-restorecon -Rv /syslog
-ausearch -m avc -ts recent        # when something silently does not work
-```
+tee /etc/systemd/system/disable-thp.service >/dev/null <<'EOF'
+[Unit]
+Description=Disable Transparent Huge Pages (THP) for Splunk
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Before=Splunkd.service
 
-Firewall is `firewalld`/`nftables`, not `iptables-persistent`. There is no
-`adm` group — grant Splunk read access via a dedicated group or `setfacl`.
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now disable-thp.service
+
+cat /sys/kernel/mm/transparent_hugepage/enabled     # [never]
+```
 
 ---
 
-## 9. Start and verify
+## 11. Zagon in validacija
 
 ```bash
 systemctl start Splunkd
 systemctl status Splunkd --no-pager
 
-# Running as splunk, not root
+# Tece kot splunk, ne root
 ps -ef | grep [s]plunkd | head -3
 ps -ef | grep [m]ongod | head -1
 
-# Limits took effect
+# Limiti so prijeli
 cat /proc/$(pgrep -f "splunkd.*under-systemd" | head -1)/limits \
   | grep -E 'processes|open files'
 
-# Ports — compare against the baseline
+# Vrata — primerjaj z baseline
 diff /root/ports-pre.txt <(ss -tlnp | grep -E '443|8000|8089|8191|9997|514|6514|8443')
 
-# Config intact
-/opt/splunk/bin/splunk btool check 2>&1 | diff /root/btool-pre.txt -
+# Konfiguracija nedotaknjena
+sudo -u splunk /opt/splunk/bin/splunk btool check 2>&1 | diff /root/btool-pre.txt -
 sudo -u splunk /opt/splunk/bin/splunk list index | diff /root/indexes-pre.txt -
 
-# splunk user can drive the service without sudo
+# splunk lahko upravlja servis brez sudo
 su - splunk -c 'systemctl restart Splunkd'
+sudo -u splunk /opt/splunk/bin/splunk status
 ```
 
-In Splunk Web:
+V Splunk Web:
 
-- Login works, including SAML/SSO if configured
-- `index=_internal earliest=-5m` returns events
-- A search against a real client index returns current data
-- Forwarder Management loads, clients phoning home
-- DB Connect health dashboard, both JVMs up (`ps -ef | grep [j]ava`)
-- Modular inputs running (`ps -ef | grep [p]ython3`)
+- Prijava deluje, vključno s SAML/SSO, če je konfiguriran
+- `index=_internal earliest=-5m` vrne dogodke
+- Iskanje po pravem client indexu vrne svež podatek
+- Forwarder Management se naloži, klienti se javljajo
+- DB Connect health dashboard, oba JVM-ja gor (`ps -ef | grep [j]ava`)
+- Modularni inputi tečejo (`ps -ef | grep [p]ython3`)
 
-Then confirm cold/frozen actually work — the failure here is delayed by days,
-so force it if you can:
+Nato potrdi, da cold/frozen dejansko delujeta — ta odpoved se pokaže šele čez
+dneve, zato jo izsili, če lahko:
 
 ```bash
 sudo -u splunk /opt/splunk/bin/splunk btool indexes list --debug \
@@ -414,33 +643,34 @@ find /colddb -newermt '-1 hour' | head
 
 ---
 
-## 10. Reboot test
+## 12. Reboot test
 
-Non-negotiable. Everything in section 6 and 7 has a persistence trap.
+Ni opcijski. Vse iz sekcij 6, 7, 8 in 10 ima past s persistenco.
 
 ```bash
 reboot
 ```
 
-After it returns:
+Po vrnitvi:
 
 ```bash
 systemctl is-active Splunkd
 ps -ef | grep [s]plunkd | head -3
 ss -tlnp | grep -E '443|8000|8089|9997|514|6514|8443'
-iptables -t nat -L -n -v | grep 8443       # redirect survived
-mount | grep -E 'colddb|frozen'            # volumes mounted before splunkd started
+iptables -t nat -L -n -v | grep 8443       # redirect prezivel
+mount | grep -E 'colddb|frozen'            # volumni priklopljeni pred splunkd
 sudo -u splunk head -1 /syslog/*/*.log 2>/dev/null | head -3
+aa-status | grep rsyslog                   # AppArmor profil nalozen
 ```
 
-If the redirect is gone: `netfilter-persistent save` was never run.
+Če je redirect izginil: `netfilter-persistent save` ni bil nikoli izveden.
 
 ---
 
-## 11. Hardening and loose ends
+## 13. Hardening in odprti konci
 
-**Stop the splunk user escalating back to root.** If it can edit
-`splunk-launch.conf`, it can set `SPLUNK_OS_USER=root` — this is Splunk
+**Prepreči, da bi se splunk uporabnik povzpel nazaj v root.** Če lahko ureja
+`splunk-launch.conf`, lahko nastavi `SPLUNK_OS_USER=root` — to je Splunk
 advisory SPL-CAAAP3M:
 
 ```bash
@@ -448,10 +678,10 @@ chown root:splunk /opt/splunk/etc/splunk-launch.conf
 chmod 640 /opt/splunk/etc/splunk-launch.conf
 ```
 
-Matters most where `splunk` is a real login account rather than a
-`useradd -r` service account.
+Najbolj pomembno tam, kjer je `splunk` pravi login račun in ne `useradd -r`
+servisni račun.
 
-**Find anything still running Splunk as root:**
+**Poišči vse, kar še vedno poganja Splunk kot root:**
 
 ```bash
 crontab -l | grep -i splunk
@@ -459,65 +689,159 @@ ls -la /etc/cron.d/ | grep -i splunk
 grep -rl '/opt/splunk/bin/splunk' /etc/cron* /usr/local/bin 2>/dev/null
 ```
 
-Backup scripts and diag cron jobs are the usual offenders. Every one of them
-needs `sudo -u splunk` in front of the binary, or it recreates root-owned files
-inside a splunk-owned tree and you are back to `Permission denied` on the
-pidfile.
+Backup skripte in diag cron opravila so običajni krivci. Vsak od njih rabi
+`sudo -u splunk` pred binarko, sicer znotraj splunk-owned drevesa spet ustvari
+root-owned datoteke in si nazaj pri `Permission denied` na pidfile.
 
-**Ongoing rule:** run the procedure as root, but every
-`$SPLUNK_HOME/bin/splunk` invocation goes through `sudo -u splunk`.
+**Stalno pravilo:** postopek izvajaš kot root, ampak vsak klic
+`$SPLUNK_HOME/bin/splunk` gre skozi `sudo -u splunk`.
 
-**Drift check** — run a week later:
+**Drift check** — poženi teden dni kasneje:
 
 ```bash
 find /opt/splunk ! -user splunk | head
 find /syslog ! -user syslog | head
 ```
 
-Anything that shows up identifies a process still running as root.
+Karkoli se pojavi, identificira proces, ki še vedno teče kot root.
 
 ---
 
-## 12. Rollback
+## 14. Rocky Linux / RHEL — razlike
 
-Restore the VM snapshot. That is the clean path.
+Postopek je enak, spremenijo se štiri stvari.
 
-Manual reversal if you have to:
+**SELinux namesto AppArmorja.** Nestandarden syslog direktorij rabi label,
+sicer rsyslog vanj tiho ne more pisati:
+
+```bash
+semanage fcontext -a -t var_log_t "/syslog(/.*)?"
+restorecon -Rv /syslog
+ausearch -m avc -ts recent        # ko nekaj tiho ne dela
+```
+
+**Ni skupine `adm`.** RHEL nima `adm` skupine v istem pomenu. Naredi namensko
+skupino:
+
+```bash
+groupadd -r syslogread
+usermod -aG syslogread splunk
+```
+
+in v `40-splunk.conf` uporabi `$FileGroup syslogread` namesto `adm`.
+Alternativa je ACL:
+
+```bash
+setfacl -R -m u:splunk:rX /syslog
+setfacl -R -d -m u:splunk:rX /syslog     # default ACL za nove datoteke
+```
+
+**rsyslog privzeto teče kot root** in ne spusti privilegijev. `$FileOwner` /
+`$FileGroup` zato eksplicitno nastavi, sicer dobiš `root:root` datoteke, ki jih
+splunk ne bere.
+
+**firewalld/nftables namesto `iptables-persistent`.** Za 443 → 8443:
+
+```bash
+firewall-cmd --permanent --add-forward-port=port=443:proto=tcp:toport=8443
+firewall-cmd --permanent --add-port=8443/tcp
+firewall-cmd --reload
+firewall-cmd --list-all
+```
+
+Za lokalni promet (`curl https://localhost`) firewalld forward-port ne velja —
+če to rabiš, dodaj še nft pravilo v `output` chain ali testiraj direktno na
+8443.
+
+---
+
+## 15. Diagnostika / pogoste težave
+
+```bash
+# splunkd se vedno tece kot root?
+#  -> preveri /opt/splunk/etc/splunk-launch.conf: SPLUNK_OS_USER=splunk
+#  -> preveri, da ni podvojene vrstice (zadnja zmaga)
+#  -> preveri lastnistvo: ls -la /opt/splunk | head
+
+# Limiti se vedno stari (npr. 15145 namesto 16384)?
+#  -> systemctl restart Splunkd (proces obdrzi limite od zagona)
+#  -> systemctl show Splunkd -p LimitNPROC -p LimitNOFILE
+
+# rsyslog ne posodablja datotek v /syslog?
+#  -> ali sploh poslusa: ss -ulnp | grep 514
+#  -> AppArmor: aa-status | grep rsyslog
+#  -> override: cat /etc/apparmor.d/local/usr.sbin.rsyslogd
+#  -> SELinux (Rocky): ausearch -m avc -ts recent
+
+# splunk ne more brati /syslog datotek?
+#  -> id splunk               (mora biti v adm)
+#  -> ls -la /syslog/<ip>/    (mora biti syslog:adm, 0640)
+#  -> manjka $PrivDropToGroup adm v 40-splunk.conf?
+#  -> test: sudo -u splunk head -1 /syslog/<ip>/<facility>.log
+
+# 443 ne dela po rebootu?
+#  -> pravila niso shranjena: netfilter-persistent save
+#  -> preveri: cat /etc/iptables/rules.v4
+
+# Podatki manjkajo samo za starejse datoteke?
+#  -> ownership sweep ni bil izveden: find /syslog ! -user syslog | head
+
+# Podroben startup log
+journalctl -u Splunkd -n 100 --no-pager
+```
+
+---
+
+## 16. Rollback
+
+Povrni VM snapshot. To je čista pot.
+
+Ročno, če je treba:
 
 ```bash
 systemctl stop Splunkd
 /opt/splunk/bin/splunk disable boot-start
 sed -i 's/^SPLUNK_OS_USER=.*/SPLUNK_OS_USER=root/' /opt/splunk/etc/splunk-launch.conf
 chown -R root:root /opt/splunk
-/opt/splunk/bin/splunk enable boot-start -systemd-managed 1 --accept-license --answer-yes --no-prompt
+/opt/splunk/bin/splunk enable boot-start -systemd-managed 1 \
+  --accept-license --answer-yes --no-prompt
 systemctl daemon-reload
 systemctl start Splunkd
 ```
 
-Also revert `web.conf` `httpport` and remove the iptables redirect if you
-changed them.
+Povrni tudi `web.conf` `httpport` in odstrani iptables redirect, če si ju
+spreminjal.
 
-Ownership on `/colddb`, `/frozenpath` and `/syslog` can stay as `splunk` — root
-reads them regardless.
+Lastništvo na `/colddb`, `/frozenpath` in `/syslog` lahko ostane `splunk` —
+root jih bere v vsakem primeru.
 
 ---
 
 ## Checklist
 
 - [ ] VM snapshot, `etc` tarball, KV store backup
-- [ ] Index paths inventoried (`btool indexes list --debug`)
-- [ ] `splunk` account is not a `sudo`-capable login user
-- [ ] `splunk` in `adm`
+- [ ] Index poti popisane (`btool indexes list --debug`)
+- [ ] `splunk` račun ni `sudo`-sposoben login uporabnik
+- [ ] `splunk` v `adm` (oz. `syslogread` na RHEL)
 - [ ] `chown -R splunk:splunk /opt/splunk`
-- [ ] `chown -R splunk:splunk` on every external cold/frozen/thawed path
-- [ ] Write test as splunk on each external path
-- [ ] `SPLUNK_OS_USER=splunk` (changed, not appended)
-- [ ] Splunk Web off port 443 (redirect persisted, or capability granted)
-- [ ] rsyslog `DirCreateMode`/`FileCreateMode` set; existing files swept
-- [ ] `splunk` can read `/syslog` (tested, not assumed)
+- [ ] `chown -R splunk:splunk` na vsaki zunanji cold/frozen/thawed poti
+- [ ] Write test kot splunk na vsaki zunanji poti
+- [ ] `SPLUNK_OS_USER=splunk` (spremenjen, ne dodan)
+- [ ] Splunk Web z 443 (redirect persistiran ali capability podeljena)
+- [ ] `iptables-persistent` nameščen, `netfilter-persistent save` izveden
+- [ ] rsyslog listenerji (`imudp` + `imtcp` 514) prisotni
+- [ ] `$PrivDropToGroup adm` + `DirCreateMode 0750` / `FileCreateMode 0640`
+- [ ] Obstoječe datoteke zaostrene in ownership sweep izveden
+- [ ] AppArmor override (Ubuntu) ali SELinux fcontext (RHEL)
+- [ ] `systemctl restart rsyslog` + `ss -tlnp | grep 514`
+- [ ] `splunk` bere `/syslog` (testirano, ne predpostavljeno)
+- [ ] TLS 6514, če je potreben — certifikat in datum poteka zabeležen
+- [ ] Logrotate stanza nameščena, rotacija preverjena
 - [ ] `enable boot-start -systemd-managed 1 -user splunk -create-polkit-rules 1`
-- [ ] limits drop-in in `.d/`, verified in `/proc/<pid>/limits`
-- [ ] splunkd running as `splunk`
-- [ ] `splunk-launch.conf` owned `root:splunk`, mode 640
-- [ ] Cron/scripts updated to `sudo -u splunk`
-- [ ] Reboot test passed, including iptables redirect and mounts
+- [ ] Limits drop-in v `.d/`, preverjen v `/proc/<pid>/limits`
+- [ ] `limits.d/99-splunk.conf` fallback
+- [ ] THP onemogočen (`disable-thp.service`)
+- [ ] splunkd teče kot `splunk`
+- [ ] `splunk-launch.conf` lastnik `root:splunk`, mode 640
+- [ ] Cron/skripte posodobljene na `sudo -u splunk`
+- [ ] Reboot test opravljen, vključno z iptables redirectom in mounti
