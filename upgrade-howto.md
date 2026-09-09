@@ -170,8 +170,13 @@ wget -O splunk-10.2.7-<build>-linux-amd64.deb \
 sudo systemctl stop Splunkd
 sudo -u splunk /opt/splunk/bin/splunk status     # confirm fully stopped
 
+
 # Required: see step 8 for why
 sudo /opt/splunk/bin/splunk disable boot-start
+```
+```bash
+in case /opt/splunk has still root permissions change them
+chown -R splunk:splunk /opt/splunk
 ```
 
 ## 7. Install the new package over the existing one
