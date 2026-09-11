@@ -17,8 +17,8 @@
 #
 # Unattended with flags:
 #   sudo bash bootstrap.sh \
-#     --splunk-version 10.2.3 \
-#     --indexer-ip 10.1.2.3 \
+#     --splunk-version 10.4.3 \
+#     --indexer-ip 10.1.4.3 \
 #     --role full
 #
 # =============================================================================
@@ -27,13 +27,12 @@ set -euo pipefail
 # ---- Curated Splunk version table -------------------------------------------
 # Add new patches here when validated. Keys = version, values = build hash.
 declare -A SPLUNK_VERSIONS=(
-    [10.4.0]="f798d4d49089"
-    [10.2.4]="1526e5e5df42"
-    [10.2.3]="4d61cf8a5c0c"
-    [10.0.6]="098ea5cc39ba"
-    [9.4.11]="bbcbf19b5450"
+  [10.4.3]="4174a2deda5d"
+  [10.2.7]="c0bff5b0fac3"
+  [9.4.15]="ae018c4ea857"
 )
-DEFAULT_VERSION="10.2.4"
+
+DEFAULT_VERSION="10.4.3"
 
 # ---- Repo & artifact locations ----------------------------------------------
 REPO_RAW="https://raw.githubusercontent.com/secureonas/splunk/main"
@@ -65,7 +64,7 @@ usage() {
 Usage: sudo bash bootstrap.sh [options]
 
 Options:
-  --splunk-version <ver>   Splunk version (e.g. 10.2.3). Picks from curated table.
+  --splunk-version <ver>   Splunk version (e.g. 10.4.3). Picks from curated table.
   --splunk-build <hash>    Override build hash (for versions not in table).
   --indexer-ip <ip>        IP this server uses as the indexer endpoint.
   --role <full|indexer>    Deployment profile. Default: full.
@@ -208,8 +207,8 @@ if [ -z "$SPLUNK_VERSION" ]; then
         echo "  c) custom (specify version + build manually)"
         choice=$(prompt "Choose version" "$default_choice")
         if [ "$choice" = "c" ] || [ "$choice" = "C" ]; then
-            SPLUNK_VERSION=$(prompt "Splunk version (e.g. 10.2.3)")
-            SPLUNK_BUILD=$(prompt "Build hash (e.g. 4d61cf8a5c0c)")
+            SPLUNK_VERSION=$(prompt "Splunk version (e.g. 10.4.3)")
+            SPLUNK_BUILD=$(prompt "Build hash (e.g. 4174a2deda5d)")
         else
             SPLUNK_VERSION="${opts[$((choice-1))]}"
         fi
